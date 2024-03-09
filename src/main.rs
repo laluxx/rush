@@ -18,7 +18,7 @@ use inkwell::context::Context;
 enum Token {
     FnKeyword,
     Identifier(String),
-    PrintlnMacro,
+    Println,
     StringLiteral(String),
     Semicolon,
 }
@@ -56,12 +56,12 @@ fn parse_identifier(input: &str) -> IResult<&str, Token> {
 }
 
 fn parse_println(input: &str) -> IResult<&str, Vec<Token>> {
-    let (input, _) = tag("println!")(input)?;
+    let (input, _) = tag("println")(input)?;
     let (input, _) = char('(')(input)?;
     let (input, string_lit) = parse_string_literal(input)?;
     let (input, _) = char(')')(input)?;
     let (input, _) = char(';')(input)?;
-    Ok((input, vec![Token::PrintlnMacro, string_lit, Token::Semicolon]))
+    Ok((input, vec![Token::Println, string_lit, Token::Semicolon]))
 }
 
 fn parse_string_literal(input: &str) -> IResult<&str, Token> {
@@ -108,8 +108,8 @@ fn tokens_to_ast(tokens: Vec<Token>) -> AstNode {
     let mut iter = tokens.iter();
     while let Some(token) = iter.next() {
         match token {
-            Token::PrintlnMacro => {
-                // Directly after PrintlnMacro, expect a StringLiteral
+            Token::Println => {
+                // Directly after Println, expect a StringLiteral
                 if let Some(next_token) = iter.next() {
                     if let Token::StringLiteral(text) = next_token {
                         body_statements.push(Statement::Println(Expression::StringLiteral(text.clone())));
@@ -149,9 +149,15 @@ fn generate_ir_from_ast<'ctx>(
                         for statement in body {
                             if let Statement::Println(expr) = statement {
                                 if let Expression::StringLiteral(text) = expr {
+                                    // let printf_type = i32_type.fn_type(&[context.i8_type().ptr_type(inkwell::AddressSpace::from(0)).into()], true);
+                                    // let printf_func = module.add_function("printf", printf_type, None);
+                                    // let global_str = builder.build_global_string_ptr(&text, "str").unwrap();
+
+                                    let text_with_newline = format!("{}\n", text);
+
                                     let printf_type = i32_type.fn_type(&[context.i8_type().ptr_type(inkwell::AddressSpace::from(0)).into()], true);
                                     let printf_func = module.add_function("printf", printf_type, None);
-                                    let global_str = builder.build_global_string_ptr(&text, "str").unwrap();
+                                    let global_str = builder.build_global_string_ptr(&text_with_newline, "str").unwrap();
                                     
                                     // Correctly specify the type of elements after the GEP operation
                                     let i8_ptr_type = context.i8_type().ptr_type(inkwell::AddressSpace::from(0));
@@ -179,6 +185,83 @@ fn generate_ir_from_ast<'ctx>(
 
 
 
+// fn main() {
+//     let file_path = "./src/hello.rh";
+//     match read_file(file_path) {
+//         Ok(program) => {
+//             match parse_function(&program) {
+//                 Ok((_, tokens)) => {
+//                     println!("Tokens: {:#?}", tokens);
+//                     let ast = tokens_to_ast(tokens);
+//                     println!("Generated AST: {:#?}", ast);
+
+//                     // Setup LLVM context, module, and builder
+//                     let context = Context::create();
+//                     let module = context.create_module("my_program");
+//                     let builder = context.create_builder();
+
+//                     // Generate IR from AST
+//                     generate_ir_from_ast(ast, &context, &module, &builder);
+//                     println!("Generated LLVM IR:");
+//                     module.print_to_stderr();
+                    
+//                 },
+//                 Err(e) => println!("Error parsing program: {:?}", e),
+//             }
+//         },
+//         Err(e) => println!("Error reading file: {:?}", e),
+//     }
+// }
+
+
+
+
+// use std::fs;
+// use std::io::Write;
+
+// fn main() {
+//     let file_path = "./src/hello.rh";
+//     match read_file(file_path) {
+//         Ok(program) => {
+//             match parse_function(&program) {
+//                 Ok((_, tokens)) => {
+//                     println!("Tokens: {:#?}", tokens);
+//                     let ast = tokens_to_ast(tokens);
+//                     println!("Generated AST: {:#?}", ast);
+
+//                     // Setup LLVM context, module, and builder
+//                     let context = Context::create();
+//                     let module = context.create_module("my_program");
+//                     let builder = context.create_builder();
+
+//                     // Generate IR from AST
+//                     generate_ir_from_ast(ast, &context, &module, &builder);
+
+//                     // Ensure the build directory exists
+//                     fs::create_dir_all("./build").expect("Failed to create build directory");
+
+//                     // Write LLVM IR to file
+//                     let ir_file_path = "./build/ir.ll";
+//                     let mut file = File::create(ir_file_path).expect("Failed to create ir.ll file");
+//                     let ir_string = module.print_to_string().to_string();
+//                     file.write_all(ir_string.as_bytes()).expect("Failed to write IR to file");
+
+//                     println!("Generated LLVM IR written to {}", ir_file_path);
+//                 },
+//                 Err(e) => println!("Error parsing program: {:?}", e),
+//             }
+//         },
+//         Err(e) => println!("Error reading file: {:?}", e),
+//     }
+// }
+
+
+
+// use std::fs::{self, File};
+use std::fs;
+use std::io::Write;
+use std::process::Command;
+
 fn main() {
     let file_path = "./src/hello.rh";
     match read_file(file_path) {
@@ -196,9 +279,38 @@ fn main() {
 
                     // Generate IR from AST
                     generate_ir_from_ast(ast, &context, &module, &builder);
-                    println!("Generated LLVM IR:");
-                    module.print_to_stderr();
-                    
+
+                    // Ensure the build directory exists
+                    let build_dir = "./build";
+                    fs::create_dir_all(build_dir).expect("Failed to create build directory");
+
+                    // Write LLVM IR to file
+                    let ir_file_path = Path::new(build_dir).join("ir.ll");
+                    let mut file = File::create(&ir_file_path).expect("Failed to create ir.ll file");
+                    let ir_string = module.print_to_string().to_string();
+                    file.write_all(ir_string.as_bytes()).expect("Failed to write IR to file");
+
+                    println!("Generated LLVM IR written to {:?}", ir_file_path);
+
+                    // Compile the IR to an executable
+                    let exe_path = Path::new(build_dir).join("executable");
+                    let output = Command::new("clang")
+                        .arg(ir_file_path.to_str().unwrap()) // Convert the PathBuf to a string slice
+                        .arg("-o")
+                        .arg(exe_path.to_str().unwrap()) // Specify the output executable path
+                        .output();
+
+                    match output {
+                        Ok(output) => {
+                            if output.status.success() {
+                                println!("Compiled executable successfully.");
+                            } else {
+                                let stderr = String::from_utf8_lossy(&output.stderr);
+                                eprintln!("Failed to compile executable: {}", stderr);
+                            }
+                        },
+                        Err(e) => eprintln!("Failed to execute clang: {}", e),
+                    }
                 },
                 Err(e) => println!("Error parsing program: {:?}", e),
             }
@@ -206,4 +318,13 @@ fn main() {
         Err(e) => println!("Error reading file: {:?}", e),
     }
 }
+
+
+
+
+
+
+
+
+
 
