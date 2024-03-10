@@ -1,7 +1,8 @@
 use nom::{
     bytes::complete::{tag, is_not},
     character::complete::{char, multispace0, multispace1},
-    sequence::delimited,
+    sequence::{delimited, preceded},
+    multi::{many0, separated_list0},
     IResult,
 };
 
@@ -14,29 +15,50 @@ use std::{
 extern crate inkwell;
 use inkwell::context::Context;
 
+
+
 #[derive(Debug, PartialEq)]
 enum Token {
     FnKeyword,
     Identifier(String),
-    Println,
+    FunctionCall {
+        name: String,
+        args: Vec<String>, // NOTE Multiple string arguments.
+    },
     StringLiteral(String),
     Semicolon,
 }
 
-// Define AST nodes
+
+use std::fmt;
+
+impl fmt::Display for Token {
+    fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
+        match self {
+            Token::FnKeyword => write!(f, "FnKeyword"),
+            Token::Identifier(id) => write!(f, "Identifier({})", id),
+            Token::FunctionCall { name, args } => write!(f, "FunctionCall({}, {:?})", name, args),
+            Token::StringLiteral(s) => write!(f, "StringLiteral({})", s),
+            Token::Semicolon => write!(f, "Semicolon"),
+        }
+    }
+}
+
+
+
 #[derive(Debug, PartialEq)]
 enum AstNode {
-    Program(Vec<AstNode>), // Contains a list of function declarations
+    Program(Vec<AstNode>),
     FunctionDecl {
         name: String,
-        body: Vec<Statement>,
+        body: Vec<FunctionCall>,
     },
-    Statement(Statement),
 }
 
 #[derive(Debug, PartialEq)]
-enum Statement {
-    Println(Expression),
+struct FunctionCall {
+    name: String,
+    args: Vec<Expression>,
 }
 
 #[derive(Debug, PartialEq)]
@@ -45,54 +67,55 @@ enum Expression {
 }
 
 
-fn parse_keyword_fn(input: &str) -> IResult<&str, Token> {
-    let (input, _) = tag("fn")(input)?;
-    Ok((input, Token::FnKeyword))
+fn parse_function_call(input: &str) -> IResult<&str, Token> {
+    let (input, name) = parse_identifier(input)?;
+    let (input, _) = char('(')(input)?;
+    
+    // Parsing arguments inside the function call, separated by commas.
+    let (input, args) = separated_list0(char(','), parse_string_literal)(input)?;
+    let (input, _) = char(')')(input)?;
+    let (input, _) = char(';')(input)?;
+
+    let args_str = args.into_iter().map(|arg| {
+        if let Token::StringLiteral(str_lit) = arg { str_lit } else { String::new() }
+    }).collect();
+
+    Ok((input, Token::FunctionCall { name: name.to_string(), args: args_str }))
 }
+
+fn parse_function(input: &str) -> IResult<&str, Vec<Token>> {
+    let (input, _) = multispace0(input)?;
+    let (input, _) = tag("fn")(input)?;
+    let (input, _) = multispace1(input)?;
+    let (input, identifier) = parse_identifier(input)?;
+    let (input, _) = multispace0(input)?;
+    let (input, _) = tag("()")(input)?;
+    let (input, _) = multispace0(input)?;
+    let (input, _) = char('{')(input)?;
+    let (input, _) = multispace0(input)?;
+
+    // Collecting function calls within the function body, properly handling whitespace and semicolons.
+    let (input, function_calls) = many0(preceded(multispace0, parse_function_call))(input)?;
+
+    let (input, _) = multispace0(input)?;
+    let (input, _) = char('}')(input)?;
+
+    let tokens = vec![Token::FnKeyword, identifier];
+    let mut tokens_with_calls = tokens;
+    tokens_with_calls.extend(function_calls);
+
+    Ok((input, tokens_with_calls))
+}
+
 
 fn parse_identifier(input: &str) -> IResult<&str, Token> {
     let (input, id) = is_not(" \t\n\r(){};")(input)?;
     Ok((input, Token::Identifier(id.to_string())))
 }
 
-fn parse_println(input: &str) -> IResult<&str, Vec<Token>> {
-    let (input, _) = tag("println")(input)?;
-    let (input, _) = char('(')(input)?;
-    let (input, string_lit) = parse_string_literal(input)?;
-    let (input, _) = char(')')(input)?;
-    let (input, _) = char(';')(input)?;
-    Ok((input, vec![Token::Println, string_lit, Token::Semicolon]))
-}
-
 fn parse_string_literal(input: &str) -> IResult<&str, Token> {
     let (input, lit) = delimited(char('"'), is_not("\""), char('"'))(input)?;
     Ok((input, Token::StringLiteral(lit.to_string())))
-}
-
-#[allow(dead_code)]
-fn parse_semicolon(input: &str) -> IResult<&str, Token> {
-    let (input, _) = char(';')(input)?;
-    Ok((input, Token::Semicolon))
-}
-
-fn parse_function(input: &str) -> IResult<&str, Vec<Token>> {
-    let (input, _) = multispace0(input)?;
-    let (input, fn_keyword) = parse_keyword_fn(input)?;
-    let (input, _) = multispace1(input)?;
-    let (input, identifier) = parse_identifier(input)?;
-    let (input, _) = multispace0(input)?;
-    let (input, _) = tag("()")(input)?;
-    let (input, _) = multispace0(input)?;
-    let (input, _) = tag("{")(input)?;
-    let (input, _) = multispace0(input)?;
-    let (input, println_tokens) = parse_println(input)?;
-    let (input, _) = multispace0(input)?;
-    let (input, _) = tag("}")(input)?;
-
-    let mut tokens = vec![fn_keyword, identifier];
-    tokens.extend(println_tokens);
-
-    Ok((input, tokens))
 }
 
 fn read_file<P: AsRef<Path>>(path: P) -> io::Result<String> {
@@ -103,30 +126,31 @@ fn read_file<P: AsRef<Path>>(path: P) -> io::Result<String> {
 }
 
 fn tokens_to_ast(tokens: Vec<Token>) -> AstNode {
-    let mut body_statements = Vec::new();
+    // Assuming only one function (main) for simplicity, but designed for potential expansion
+    let mut main_function_body: Vec<FunctionCall> = Vec::new();
 
-    let mut iter = tokens.iter();
-    while let Some(token) = iter.next() {
+    // Iterate over tokens to build function calls
+    for token in tokens {
         match token {
-            Token::Println => {
-                // Directly after Println, expect a StringLiteral
-                if let Some(next_token) = iter.next() {
-                    if let Token::StringLiteral(text) = next_token {
-                        body_statements.push(Statement::Println(Expression::StringLiteral(text.clone())));
-                    }
-                }
+            Token::FunctionCall { name, args } => {
+                let arguments = args.iter().map(|arg| Expression::StringLiteral(arg.clone())).collect();
+                let function_call = FunctionCall { name, args: arguments };
+                main_function_body.push(function_call);
             },
             _ => {}
         }
     }
 
-    AstNode::Program(vec![
-        AstNode::FunctionDecl {
-            name: "main".to_string(),
-            body: body_statements,
-        },
-    ])
+    // Construct the main function node
+    let main_function_node = AstNode::FunctionDecl {
+        name: "main".to_string(), // Assuming "main" is the entry point
+        body: main_function_body,
+    };
+
+    // Construct the program node containing the main function
+    AstNode::Program(vec![main_function_node])
 }
+
 
 
 fn generate_ir_from_ast<'ctx>(
@@ -141,123 +165,47 @@ fn generate_ir_from_ast<'ctx>(
     let basic_block = context.append_basic_block(main_function, "entry");
     builder.position_at_end(basic_block);
 
-    match ast {
-        AstNode::Program(functions) => {
-            for function in functions {
-                if let AstNode::FunctionDecl { name, body } = function {
-                    if name == "main" {
-                        for statement in body {
-                            if let Statement::Println(expr) = statement {
-                                if let Expression::StringLiteral(text) = expr {
-                                    // let printf_type = i32_type.fn_type(&[context.i8_type().ptr_type(inkwell::AddressSpace::from(0)).into()], true);
-                                    // let printf_func = module.add_function("printf", printf_type, None);
-                                    // let global_str = builder.build_global_string_ptr(&text, "str").unwrap();
+    // Assuming the printf function is declared in the module
+    let printf_fn = module.get_function("printf").unwrap_or_else(|| {
+        let printf_type = i32_type.fn_type(&[context.i8_type().ptr_type(inkwell::AddressSpace::from(0)).into()], true);
+        module.add_function("printf", printf_type, None)
+    });
 
-                                    let text_with_newline = format!("{}\n", text);
+    if let AstNode::Program(functions) = ast {
+        for function in functions {
+            if let AstNode::FunctionDecl { name, body } = function {
+                if name == "main" {
+                    for function_call in body {
+                        match function_call.name.as_str() {
+                            // Adjust the match pattern as necessary
+                            "Identifier(println)" => {
+                                for arg in &function_call.args {
+                                    if let Expression::StringLiteral(text) = arg {
+                                        let formatted_text = format!("{}\n\0", text); // Ensure null-termination.
+                                        let global_str = builder.build_global_string_ptr(&formatted_text, "formatted_str")
+                                            .expect("Failed to build global string ptr");
 
-                                    let printf_type = i32_type.fn_type(&[context.i8_type().ptr_type(inkwell::AddressSpace::from(0)).into()], true);
-                                    let printf_func = module.add_function("printf", printf_type, None);
-                                    let global_str = builder.build_global_string_ptr(&text_with_newline, "str").unwrap();
-                                    
-                                    // Correctly specify the type of elements after the GEP operation
-                                    let i8_ptr_type = context.i8_type().ptr_type(inkwell::AddressSpace::from(0));
-                                    let indices = [i32_type.const_int(0, false).into(), i32_type.const_int(0, false).into()];
-                                    
-                                    // Correctly call build_gep with the pointee type
-                                    let ptr = unsafe {
-                                        builder.build_gep(i8_ptr_type, global_str.as_pointer_value(), &indices, "str_ptr").unwrap()
-                                    };
-                                    
-                                    // Correctly call printf_func
-                                    builder.build_call(printf_func, &[ptr.into()], "printf_call").unwrap();
+                                        // Directly get the pointer value from the Result
+                                        let global_str_ptr = global_str.as_pointer_value();
+                                        builder.build_call(printf_fn, &[global_str_ptr.into()], "printf_call")
+                                            .expect("Failed to build call to printf");
+                                    }
                                 }
-                            }
+                            },
+                            _ => {}
                         }
                     }
                 }
             }
-        },
-        _ => {}
+        }
     }
 
-    builder.build_return(Some(&i32_type.const_int(0, false)));
+    builder.build_return(Some(&i32_type.const_int(0, false))).expect("Failed to build return");
 }
 
 
 
-// fn main() {
-//     let file_path = "./src/hello.rh";
-//     match read_file(file_path) {
-//         Ok(program) => {
-//             match parse_function(&program) {
-//                 Ok((_, tokens)) => {
-//                     println!("Tokens: {:#?}", tokens);
-//                     let ast = tokens_to_ast(tokens);
-//                     println!("Generated AST: {:#?}", ast);
 
-//                     // Setup LLVM context, module, and builder
-//                     let context = Context::create();
-//                     let module = context.create_module("my_program");
-//                     let builder = context.create_builder();
-
-//                     // Generate IR from AST
-//                     generate_ir_from_ast(ast, &context, &module, &builder);
-//                     println!("Generated LLVM IR:");
-//                     module.print_to_stderr();
-                    
-//                 },
-//                 Err(e) => println!("Error parsing program: {:?}", e),
-//             }
-//         },
-//         Err(e) => println!("Error reading file: {:?}", e),
-//     }
-// }
-
-
-
-
-// use std::fs;
-// use std::io::Write;
-
-// fn main() {
-//     let file_path = "./src/hello.rh";
-//     match read_file(file_path) {
-//         Ok(program) => {
-//             match parse_function(&program) {
-//                 Ok((_, tokens)) => {
-//                     println!("Tokens: {:#?}", tokens);
-//                     let ast = tokens_to_ast(tokens);
-//                     println!("Generated AST: {:#?}", ast);
-
-//                     // Setup LLVM context, module, and builder
-//                     let context = Context::create();
-//                     let module = context.create_module("my_program");
-//                     let builder = context.create_builder();
-
-//                     // Generate IR from AST
-//                     generate_ir_from_ast(ast, &context, &module, &builder);
-
-//                     // Ensure the build directory exists
-//                     fs::create_dir_all("./build").expect("Failed to create build directory");
-
-//                     // Write LLVM IR to file
-//                     let ir_file_path = "./build/ir.ll";
-//                     let mut file = File::create(ir_file_path).expect("Failed to create ir.ll file");
-//                     let ir_string = module.print_to_string().to_string();
-//                     file.write_all(ir_string.as_bytes()).expect("Failed to write IR to file");
-
-//                     println!("Generated LLVM IR written to {}", ir_file_path);
-//                 },
-//                 Err(e) => println!("Error parsing program: {:?}", e),
-//             }
-//         },
-//         Err(e) => println!("Error reading file: {:?}", e),
-//     }
-// }
-
-
-
-// use std::fs::{self, File};
 use std::fs;
 use std::io::Write;
 use std::process::Command;
@@ -318,13 +266,4 @@ fn main() {
         Err(e) => println!("Error reading file: {:?}", e),
     }
 }
-
-
-
-
-
-
-
-
-
 
