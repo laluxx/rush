@@ -1,4 +1,15 @@
+fn p() {
+    println("p() called!");
+}
+
+fn c() {
+    println("c() called!");
+}
+
 fn main() {
     println("Hello!");
+    p();
+    c();
 }
+
 

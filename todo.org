@@ -1,10 +1,9 @@
 generate a flow chart png from AST
-compile both to lua and asm
-also interpreted lang
+flag to compile to lua
 both functional(ml like) and imperative
+if #!/bin/rush is found use the interpreter mode 
+look into incremental compilation 
 
-
-i have to manually declare printf in the ir file ?
 
 
 llc -filetype=obj ./src/ir.ll -o ./src/ir.o

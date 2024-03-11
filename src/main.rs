@@ -15,8 +15,6 @@ use std::{
 extern crate inkwell;
 use inkwell::context::Context;
 
-
-
 #[derive(Debug, PartialEq)]
 enum Token {
     FnKeyword,
@@ -24,6 +22,11 @@ enum Token {
     FunctionCall {
         name: String,
         args: Vec<String>, // NOTE Multiple string arguments.
+    },
+    FunctionDecl {
+        name: String,
+        args: Vec<String>, // For simplicity, assume no arguments for now
+        body: Vec<Token>,  // This will contain tokens representing the function body
     },
     StringLiteral(String),
     Semicolon,
@@ -38,13 +41,12 @@ impl fmt::Display for Token {
             Token::FnKeyword => write!(f, "FnKeyword"),
             Token::Identifier(id) => write!(f, "Identifier({})", id),
             Token::FunctionCall { name, args } => write!(f, "FunctionCall({}, {:?})", name, args),
+            Token::FunctionDecl { name, args, body } => write!(f, "FunctionDecl({}, {:?})", name, args),
             Token::StringLiteral(s) => write!(f, "StringLiteral({})", s),
             Token::Semicolon => write!(f, "Semicolon"),
         }
     }
 }
-
-
 
 #[derive(Debug, PartialEq)]
 enum AstNode {
@@ -66,6 +68,9 @@ enum Expression {
     StringLiteral(String),
 }
 
+fn parse_program(input: &str) -> IResult<&str, Vec<Token>> {
+    many0(parse_function)(input)
+}
 
 fn parse_function_call(input: &str) -> IResult<&str, Token> {
     let (input, name) = parse_identifier(input)?;
@@ -83,28 +88,31 @@ fn parse_function_call(input: &str) -> IResult<&str, Token> {
     Ok((input, Token::FunctionCall { name: name.to_string(), args: args_str }))
 }
 
-fn parse_function(input: &str) -> IResult<&str, Vec<Token>> {
+fn parse_function(input: &str) -> IResult<&str, Token> {
     let (input, _) = multispace0(input)?;
     let (input, _) = tag("fn")(input)?;
     let (input, _) = multispace1(input)?;
     let (input, identifier) = parse_identifier(input)?;
     let (input, _) = multispace0(input)?;
-    let (input, _) = tag("()")(input)?;
+    let (input, _) = tag("()")(input)?; // Simplifies assumption: no arguments
     let (input, _) = multispace0(input)?;
     let (input, _) = char('{')(input)?;
     let (input, _) = multispace0(input)?;
 
-    // Collecting function calls within the function body, properly handling whitespace and semicolons.
-    let (input, function_calls) = many0(preceded(multispace0, parse_function_call))(input)?;
+    let (input, body) = many0(preceded(multispace0, parse_function_call))(input)?;
 
     let (input, _) = multispace0(input)?;
     let (input, _) = char('}')(input)?;
 
-    let tokens = vec![Token::FnKeyword, identifier];
-    let mut tokens_with_calls = tokens;
-    tokens_with_calls.extend(function_calls);
-
-    Ok((input, tokens_with_calls))
+    if let Token::Identifier(name) = identifier {
+        Ok((input, Token::FunctionDecl {
+            name,
+            args: vec![], // Simplified: no arguments handled
+            body,
+        }))
+    } else {
+        Err(nom::Err::Error(nom::error::Error::new(input, nom::error::ErrorKind::Tag)))
+    }
 }
 
 
@@ -126,32 +134,24 @@ fn read_file<P: AsRef<Path>>(path: P) -> io::Result<String> {
 }
 
 fn tokens_to_ast(tokens: Vec<Token>) -> AstNode {
-    // Assuming only one function (main) for simplicity, but designed for potential expansion
-    let mut main_function_body: Vec<FunctionCall> = Vec::new();
+    let functions = tokens.into_iter().filter_map(|token| match token {
+        Token::FunctionDecl { name, body, .. } => {
+            let function_calls: Vec<FunctionCall> = body.into_iter().filter_map(|token| {
+                if let Token::FunctionCall { name, args } = token {
+                    Some(FunctionCall {
+                        name,
+                        args: args.into_iter().map(Expression::StringLiteral).collect(),
+                    })
+                } else { None }
+            }).collect();
 
-    // Iterate over tokens to build function calls
-    for token in tokens {
-        match token {
-            Token::FunctionCall { name, args } => {
-                let arguments = args.iter().map(|arg| Expression::StringLiteral(arg.clone())).collect();
-                let function_call = FunctionCall { name, args: arguments };
-                main_function_body.push(function_call);
-            },
-            _ => {}
-        }
-    }
+            Some(AstNode::FunctionDecl { name, body: function_calls })
+        },
+        _ => None,
+    }).collect();
 
-    // Construct the main function node
-    let main_function_node = AstNode::FunctionDecl {
-        name: "main".to_string(), // Assuming "main" is the entry point
-        body: main_function_body,
-    };
-
-    // Construct the program node containing the main function
-    AstNode::Program(vec![main_function_node])
+    AstNode::Program(functions)
 }
-
-
 
 fn generate_ir_from_ast<'ctx>(
     ast: AstNode,
@@ -160,50 +160,60 @@ fn generate_ir_from_ast<'ctx>(
     builder: &inkwell::builder::Builder<'ctx>,
 ) {
     let i32_type = context.i32_type();
-    let fn_type = i32_type.fn_type(&[], false);
-    let main_function = module.add_function("main", fn_type, None);
-    let basic_block = context.append_basic_block(main_function, "entry");
-    builder.position_at_end(basic_block);
+    let void_type = context.void_type();
+    let printf_fn_type = i32_type.fn_type(&[context.i8_type().ptr_type(inkwell::AddressSpace::from(0)).into()], true);
+    let printf_fn = module.add_function("printf", printf_fn_type, None);
 
-    // Assuming the printf function is declared in the module
-    let printf_fn = module.get_function("printf").unwrap_or_else(|| {
-        let printf_type = i32_type.fn_type(&[context.i8_type().ptr_type(inkwell::AddressSpace::from(0)).into()], true);
-        module.add_function("printf", printf_type, None)
-    });
+    // AstNode::Program contains a Vec<AstNode> of FunctionDecl
+    if let AstNode::Program(function_decls) = ast {
+        // Declare functions first
+        for function_decl in &function_decls {
+            if let AstNode::FunctionDecl { ref name, .. } = function_decl {
+                let fn_type = match name.as_str() {
+                    "main" => i32_type.fn_type(&[], false),
+                    _ => void_type.fn_type(&[], false),
+                };
+                module.add_function(name, fn_type, None);
+            }
+        }
 
-    if let AstNode::Program(functions) = ast {
-        for function in functions {
-            if let AstNode::FunctionDecl { name, body } = function {
-                if name == "main" {
-                    for function_call in body {
-                        match function_call.name.as_str() {
-                            // Adjust the match pattern as necessary
-                            "Identifier(println)" => {
-                                for arg in &function_call.args {
-                                    if let Expression::StringLiteral(text) = arg {
-                                        let formatted_text = format!("{}\n\0", text); // Ensure null-termination.
-                                        let global_str = builder.build_global_string_ptr(&formatted_text, "formatted_str")
-                                            .expect("Failed to build global string ptr");
+        // Generate function bodies
+        for function_decl in function_decls {
+            if let AstNode::FunctionDecl { name, body } = function_decl {
+                let llvm_function = module.get_function(&name).expect("Function not found");
+                let entry = context.append_basic_block(llvm_function, "entry");
+                builder.position_at_end(entry);
 
-                                        // Directly get the pointer value from the Result
-                                        let global_str_ptr = global_str.as_pointer_value();
-                                        builder.build_call(printf_fn, &[global_str_ptr.into()], "printf_call")
-                                            .expect("Failed to build call to printf");
-                                    }
-                                }
-                            },
-                            _ => {}
-                        }
+                for function_call in body {
+                    let FunctionCall { name, args } = function_call;
+                    match name.as_str() {
+                        // Adjust based on your FunctionCall structure and naming
+                        "Identifier(println)" => {
+                            for Expression::StringLiteral(text) in args {
+                                let formatted_text = format!("{}\n\0", text);
+                                let global_str = builder.build_global_string_ptr(&formatted_text, "str")
+                                                        .expect("Failed to build global string pointer");
+                                builder.build_call(printf_fn, &[global_str.as_pointer_value().into()], "printf_call")
+                                       .expect("Failed to build call to printf");
+                            }
+                        },
+                        _ => {
+                            let called_function = module.get_function(&name.trim_start_matches("Identifier(").trim_end_matches(")"))
+                                                         .expect("Called function not found");
+                            builder.build_call(called_function, &[], "").expect("Failed to build call to function");
+                        },
                     }
+                }
+
+                if name == "main" {
+                    builder.build_return(Some(&i32_type.const_int(0, false)));
+                } else {
+                    builder.build_return(None);
                 }
             }
         }
     }
-
-    builder.build_return(Some(&i32_type.const_int(0, false))).expect("Failed to build return");
 }
-
-
 
 
 use std::fs;
@@ -212,58 +222,72 @@ use std::process::Command;
 
 fn main() {
     let file_path = "./src/hello.rh";
-    match read_file(file_path) {
-        Ok(program) => {
-            match parse_function(&program) {
-                Ok((_, tokens)) => {
-                    println!("Tokens: {:#?}", tokens);
-                    let ast = tokens_to_ast(tokens);
-                    println!("Generated AST: {:#?}", ast);
+    let program = match read_file(file_path) {
+        Ok(program) => program,
+        Err(e) => {
+            println!("Error reading file: {:?}", e);
+            return;
+        }
+    };
 
-                    // Setup LLVM context, module, and builder
-                    let context = Context::create();
-                    let module = context.create_module("my_program");
-                    let builder = context.create_builder();
+    let tokens = match parse_program(&program) {
+        Ok((_, tokens)) => tokens,
+        Err(e) => {
+            println!("Error parsing program: {:?}", e);
+            return;
+        }
+    };
 
-                    // Generate IR from AST
-                    generate_ir_from_ast(ast, &context, &module, &builder);
+    println!("Tokens: {:#?}", tokens);
+    let ast = tokens_to_ast(tokens);
+    println!("Generated AST: {:#?}", ast);
 
-                    // Ensure the build directory exists
-                    let build_dir = "./build";
-                    fs::create_dir_all(build_dir).expect("Failed to create build directory");
+    // Setup LLVM context, module, and builder
+    let context = Context::create();
+    let module = context.create_module("my_program");
+    let builder = context.create_builder();
 
-                    // Write LLVM IR to file
-                    let ir_file_path = Path::new(build_dir).join("ir.ll");
-                    let mut file = File::create(&ir_file_path).expect("Failed to create ir.ll file");
-                    let ir_string = module.print_to_string().to_string();
-                    file.write_all(ir_string.as_bytes()).expect("Failed to write IR to file");
+    // Generate IR from AST
+    generate_ir_from_ast(ast, &context, &module, &builder);
 
-                    println!("Generated LLVM IR written to {:?}", ir_file_path);
+    // Ensure the build directory exists
+    let build_dir = Path::new("./build");
+    fs::create_dir_all(build_dir).expect("Failed to create build directory");
 
-                    // Compile the IR to an executable
-                    let exe_path = Path::new(build_dir).join("executable");
-                    let output = Command::new("clang")
-                        .arg(ir_file_path.to_str().unwrap()) // Convert the PathBuf to a string slice
-                        .arg("-o")
-                        .arg(exe_path.to_str().unwrap()) // Specify the output executable path
-                        .output();
+    // Write LLVM IR to file and compile it
+    generate_and_write_ir(&context, &module, build_dir);
+}
 
-                    match output {
-                        Ok(output) => {
-                            if output.status.success() {
-                                println!("Compiled executable successfully.");
-                            } else {
-                                let stderr = String::from_utf8_lossy(&output.stderr);
-                                eprintln!("Failed to compile executable: {}", stderr);
-                            }
-                        },
-                        Err(e) => eprintln!("Failed to execute clang: {}", e),
-                    }
-                },
-                Err(e) => println!("Error parsing program: {:?}", e),
+
+fn compile_to_executable(ir_file_path: &Path, exe_path: &Path) {
+    let output = Command::new("clang")
+        .arg(ir_file_path.to_str().unwrap()) // Convert the PathBuf to a string slice
+        .arg("-o")
+        .arg(exe_path.to_str().unwrap()) // Specify the output executable path
+        .output();
+
+    match output {
+        Ok(output) => {
+            if output.status.success() {
+                println!("Compiled executable successfully.");
+            } else {
+                let stderr = String::from_utf8_lossy(&output.stderr);
+                eprintln!("Failed to compile executable: {}", stderr);
             }
         },
-        Err(e) => println!("Error reading file: {:?}", e),
+        Err(e) => eprintln!("Failed to execute clang: {}", e),
     }
+}
+
+fn generate_and_write_ir(context: &Context, module: &inkwell::module::Module, build_dir: &Path) {
+    let ir_file_path = build_dir.join("ir.ll");
+    let mut file = File::create(&ir_file_path).expect("Failed to create ir.ll file");
+    let ir_string = module.print_to_string().to_string();
+    file.write_all(ir_string.as_bytes()).expect("Failed to write IR to file");
+    println!("Generated LLVM IR written to {:?}", ir_file_path);
+
+    // Compile the IR to an executable
+    let exe_path = build_dir.join("executable");
+    compile_to_executable(&ir_file_path, &exe_path);
 }
 
